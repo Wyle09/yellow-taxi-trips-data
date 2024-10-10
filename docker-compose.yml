@@ -1,0 +1,7 @@
+services:
+  app:
+    build: .
+    container_name: python_duckdb_app
+    volumes:
+      - ./data:/app/data
+    command: python main.py
