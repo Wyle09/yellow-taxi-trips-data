@@ -1,5 +1,5 @@
 # Yellow Taxi Trip Distance Analysis
-This project focuses on extracting and analyzing taxi trips over the 0.9 percentile in distance traveled from a dataset of New York City taxi trips stored in Parquet format.
+This project focuses on extracting and analyzing taxi trips over the 0.9 percentile in distance traveled from a dataset of [New York City taxi trips](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) stored in Parquet format.
 
 ## Problem Statement
 Task: Extract all taxi trips that exceed the 0.9 percentile of distance traveled for any available Parquet files.
