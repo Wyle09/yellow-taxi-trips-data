@@ -3,16 +3,15 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field, fields
-from typing import Dict, List, get_type_hints
+from typing import Dict, get_type_hints
 
 import duckdb
-import pandas
 
 logging.basicConfig(
-    level=logging.DEBUG,  # Set logging level to DEBUG to capture detailed logs
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
-    force=True
+    force=True,
 )
 
 # Map Python types to DuckDB types
@@ -22,8 +21,6 @@ TYPE_MAPPING = {
     float: "DOUBLE",
     bool: "BOOLEAN",
 }
-
-BATCH_SIZE = 1000
 
 
 @dataclass
@@ -68,6 +65,7 @@ def map_python_type_to_duckdb(field: field) -> str:
 
 def create_table_from_dataclass(con, table_name: str, dataclass):
     """Generate DuckDB CREATE TABLE schema from the dataclass and execute it."""
+    logging.debug(f"Creating table {table_name} from dataclass {dataclass.__name__}")
     fields_definitions = []
 
     for field_obj in fields(dataclass):
@@ -82,12 +80,14 @@ def create_table_from_dataclass(con, table_name: str, dataclass):
     );
     """
 
+    logging.debug(f"Executing SQL to create table: {create_table_sql}")
     # Execute the dynamically generated SQL
     con.execute(create_table_sql)
 
 
 def precompute_field_mappings() -> dict:
     """Pre-compute a mapping from raw file field names (including all aliases) to normalized dataclass field names."""
+    logging.debug("Precomputing field mappings for TaxiTrip dataclass")
     field_mapping = {}
 
     # Iterate through the fields in the TaxiTrip dataclass
@@ -101,78 +101,106 @@ def precompute_field_mappings() -> dict:
         for alias in aliases:
             field_mapping[alias] = normalized_field_name
 
+    logging.debug(f"Field mappings: {field_mapping}")
     return field_mapping
-
-
-def load_parquet_files(directory: str) -> List[pandas.DataFrame]:
-    """Load all Parquet files from the specified directory and return them as a list of DataFrames."""
-    logging.info(f"Loading Parquet files from directory: {directory}")
-
-    dataframes = []
-    for filename in os.listdir(directory):
-        if filename.endswith(".parquet"):
-            logging.debug(f"Loading file: {filename}")
-            df = pandas.read_parquet(os.path.join(directory, filename))
-            dataframes.append(df)
-
-    logging.info(f"Loaded {len(dataframes)} Parquet files.")
-    return dataframes
-
-
-def bulk_insert_records(con, df: pandas.DataFrame, file_name: str):
-    """Insert multiple records into the database in a single query."""
-    # Add the file_name column to the DataFrame
-    df["file_name"] = file_name
-
-    # Insert the entire DataFrame into DuckDB
-    con.execute("INSERT INTO raw_taxi_trips SELECT * FROM df")
 
 
 def file_already_imported(con, file_name: str) -> bool:
     """Check if a file has already been imported by checking the file_name column."""
+    logging.debug(f"Checking if file {file_name} has already been imported")
     query = "SELECT COUNT(*) FROM raw_taxi_trips WHERE file_name = ?"
-    result = con.execute(query, (file_name,)).fetchone()
-    return result[0] > 0
+    try:
+        result = con.execute(query, (file_name,)).fetchone()
+        if result and len(result) > 0:
+            logging.debug(
+                f"File {file_name} import status: {'Already imported' if result[0] > 0 else 'Not imported'}"
+            )
+            return result[0] > 0
+        else:
+            logging.error(
+                f"Unexpected result format when checking file import status for {file_name}: {result}"
+            )
+            return False
+    except Exception as e:
+        logging.error(f"E")
 
+def get_parquet_columns(con, file_path: str) -> list:
+    """Retrieve the list of columns from a Parquet file."""
+    try:
+        parquet_columns = con.execute(f"SELECT * FROM read_parquet('{file_path}') LIMIT 0").fetchdf().columns
+        return list(parquet_columns)
+    except Exception as e:
+        logging.error(f"Error retrieving columns from {file_path}: {e}")
+        return []
 
-def normalize_dataframe(
-    df: pandas.DataFrame, field_map: Dict[str, str]
-) -> pandas.DataFrame:
-    """Vectorized normalization of the entire dataframe based on the precomputed field map."""
-    # Rename columns based on the field map (vectorized)
-    df_normalized = df.rename(columns=field_map)
-
-    # Add missing columns with default values from TaxiTrip
+def generate_select_statement(field_map: Dict[str, str], file_path: str, parquet_columns: list) -> str:
+    """Generate the SELECT statement for mapping raw fields to normalized fields, handling missing columns."""
+    select_clause = []
     for field_obj in fields(TaxiTrip):
-        if field_obj.name not in df_normalized.columns:
-            df_normalized[field_obj.name] = field_obj.default
+        normalized_field = field_obj.name
+        raw_field = field_map.get(normalized_field, normalized_field)
+        default_value = field_obj.default
 
-    return df_normalized
+        match default_value:
+            case str() if default_value:
+                default_value_str = f"'{default_value}'"
+            case str():
+                default_value_str = "NULL"
+            case int() | float() | bool():
+                default_value_str = str(default_value)
+            case _:
+                default_value_str = "NULL"
+
+        # Match-case for handling column presence in parquet_columns
+        match raw_field in parquet_columns:
+            case True:
+                # Column exists in the parquet file, use COALESCE
+                select_clause.append(f"COALESCE({raw_field}, {default_value_str})")
+            case False:
+                # Column does not exist, use the default value directly
+                select_clause.append(f"{default_value_str} AS {normalized_field}")
+
+    # Add file_name for tracking
+    select_clause.append(f"'{os.path.basename(file_path)}' AS file_name")
+
+    return ', '.join(select_clause)
 
 
-def bulk_insert_records(con, df: pandas.DataFrame, file_name: str):
-    """Insert multiple records into the database in a single query."""
-    # Add the file_name column to the DataFrame
-    df["file_name"] = file_name
+def generate_insert_statement(select_clause: str, file_path: str) -> str:
+    """Generate the INSERT statement for inserting records from a Parquet file."""
+    return f"INSERT INTO raw_taxi_trips SELECT {select_clause} FROM read_parquet('{file_path}')"
 
-    # Insert in batches for efficiency
-    for i in range(0, len(df), BATCH_SIZE):
-        chunk = df.iloc[i : i + BATCH_SIZE]
 
-        # Create a temporary DuckDB relation from the chunk
-        chunk_rel = con.from_df(chunk)
+def bulk_insert_records_from_parquet(con, file_path: str, field_map: Dict[str, str]):
+    """Efficiently insert multiple records directly from a Parquet file with proper field mapping."""
+    logging.info(f"Bulk inserting records from Parquet file: {file_path}")
+    try:
+        # Retrieve the columns from the Parquet file
+        parquet_columns = get_parquet_columns(con, file_path)
 
-        # Insert data from the relation into the table
-        chunk_rel.insert_into("raw_taxi_trips")
+        # Generate the SELECT statement to map the raw fields to normalized fields
+        select_clause = generate_select_statement(field_map, file_path, parquet_columns)
+
+        # Create the SQL for inserting with field mapping
+        insert_sql = generate_insert_statement(select_clause, file_path)
+
+        # Execute the insertion SQL
+        con.execute(insert_sql)
+        logging.info(f"Successfully inserted records from {file_path}")
+    except Exception as e:
+        logging.error(f"Error inserting records from {file_path}: {e}")
 
 
 def main():
     data_dir = "data"
+    logging.info(f"Starting data ingestion process, data directory: {data_dir}")
     if not os.path.exists(data_dir):
+        logging.info(f"Data directory {data_dir} does not exist, creating it.")
         os.makedirs(data_dir)
 
     # Create a DuckDB connection and raw_taxi_trips table
     duckdb_file_path = os.path.join(data_dir, "taxi_trips.duckdb")
+    logging.info(f"Connecting to DuckDB at path: {duckdb_file_path}")
     con = duckdb.connect(duckdb_file_path)
     create_table_from_dataclass(con, "raw_taxi_trips", TaxiTrip)
 
@@ -189,24 +217,18 @@ def main():
         time.sleep(5)
         sys.exit(0)
 
-    # Process each file
+    logging.info(f"Found {len(parquet_filenames)} Parquet files to process.")
+
+    # Process each file serially for debugging purposes
     for file_name in parquet_filenames:
-        # Check if the file has already been imported
-        if file_already_imported(con, file_name):
+        if not file_already_imported(con, file_name):
+            bulk_insert_records_from_parquet(
+                con, os.path.join(data_dir, file_name), field_map
+            )
+        else:
             logging.info(f"Skipping {file_name}, already imported.")
-            continue
 
-        logging.info(f"Processing {file_name}...")
-
-        # Load the parquet file into a DataFrame only if not already imported
-        file_path = os.path.join(data_dir, file_name)
-        df = pandas.read_parquet(file_path)
-
-        # Vectorized normalization of the entire DataFrame
-        df_normalized = normalize_dataframe(df, field_map)
-
-        # Bulk insert the normalized DataFrame in batches
-        bulk_insert_records(con, df_normalized, file_name)
+    logging.info("Data ingestion process completed.")
 
 
 if __name__ == "__main__":
